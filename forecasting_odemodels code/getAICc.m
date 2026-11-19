@@ -1,15 +1,23 @@
-function [AICc,part1,part2,numparams]=getAICc(method1,dist1,params_num,fixI0,fval,n)
+function [AICc,part1,part2,numparams]=getAICc(method1,dist1,params_num,fixI0,fval,n,fvalAdjust)
+% Optional 7th input fvalAdjust (count likelihoods, method1 = 1, 3, 4, 5): amount
+% added to fval so that fval + fvalAdjust is the complete negative log-likelihood
+% of the n observations, including the sum(log(y!)) term the fitting objective
+% leaves out (see quantdiffAICcCountAdjustment). It makes the AICc of these methods
+% comparable with methods 0 and 6, whose formulas below are complete likelihoods.
+% Omitted or empty -> 0, the former behaviour. Ignored for methods 0 and 6.
+
+if nargin < 7 || isempty(fvalAdjust)
+    fvalAdjust = 0;
+end
   
 numparams=params_num;
     
 numparams=numparams+fixI0;
     
 
-if method1==0 & dist1==0 % Normal distribution -- one parameter for variance
-
-    numparams=numparams+1;
-
-elseif method1==0 & dist1==2 % Neg. binomial error structure where var = factor1*mean
+if method1==0 % Least squares: the Gaussian likelihood behind the AICc formula below
+               % estimates the variance (SSE/n), so it counts as one parameter whatever
+               % dist1 the bootstrap uses (0, 1 or 2). dist1 only sets the bootstrap noise.
 
     numparams=numparams+1;
 
@@ -27,6 +35,13 @@ elseif method1==6  % Laplace distribution -- one parameter for scale
 
 end
 
+% The small-sample correction 2k(k+1)/(n-k-1) is only defined for n - k - 1 > 0,
+% i.e. at most n - 2 estimated quantities. Fail clearly instead of returning an
+% infinite or negative AICc.
+if n-numparams-1 <= 0
+    error('getAICc:tooFewData', ...
+        'AICc needs at least k + 2 data points: n = %d, k = %d estimated quantities (k must be at most n - 2).', n, numparams);
+end
 
 switch method1
     
@@ -49,9 +64,9 @@ switch method1
 
     otherwise
         
-        AICc=-2*(-fval) + 2*numparams + (2*numparams*(numparams+1))/(n-numparams-1);
+        AICc=-2*(-(fval+fvalAdjust)) + 2*numparams + (2*numparams*(numparams+1))/(n-numparams-1);
         
-        part1=-2*(-fval);
+        part1=-2*(-(fval+fvalAdjust));
         
         part2=2*numparams + (2*numparams*(numparams+1))/(n-numparams-1);
 

@@ -59,6 +59,10 @@ datatype=datatype_INP;
 
 d=1;
 
+% Stop now, before any work is done, if the options file selects an unsupported
+% estimation method (e.g. method1 = 2).
+quantdiffCheckMethod(method1, mfilename);
+
 dist1=dist1_INP; %Define dist1 which is the type of error structure:
 
 if method1>0
@@ -67,10 +71,11 @@ end
 
 % LSQ=0,
 % MLE Poisson=1,
-% Pearson chi-squard=2,
 % MLE (Neg Binomial)=3, with VAR=mean+alpha*mean;
 % MLE (Neg Binomial)=4, with VAR=mean+alpha*mean^2;
 % MLE (Neg Binomial)=5, with VAR=mean+alpha*mean^d;
+% SAD (Laplace)=6;
+% (2 is not an estimation method; dist1=2 is the NB bootstrap noise used with LSQ)
 
 
 numstartpoints=numstartpoints_INP; % Number of initial guesses for optimization procedure using MultiStart
@@ -209,12 +214,23 @@ printscreen1=printscreen1_INP;
 
 numparams=get_nparams(method1,dist1,sum(params.fixed==0),length(vars.fit_index).*(params.fixI0==0));
 
+% Observations the fit has to explain: with params.fixI0 = 1 the first point of
+% every fitted series is matched exactly by construction and is not counted
+% (see quantdiffEffectiveN).
+[nEffWindow, nEffInfo]=quantdiffEffectiveN(windowsize1*length(vars.fit_index),length(vars.fit_index),params.fixI0);
+
 numparams
-windowsize1*length(vars.fit_index)
+nEffWindow
 
-if numparams>=windowsize1*length(vars.fit_index)
+% AICc's small-sample correction divides by n - numparams - 1, so the window
+% needs at least numparams + 2 informative data points (numparams <= n - 2).
+if numparams>=nEffWindow-1
 
-    error("Number of estimated parameters should be smaller than the number of data points. Consider increasing the length of the calibration period.")
+    error(['The calibration window has %d informative data points (%d observations, %d of them fixed ' ...
+        'first points) but %d quantities are estimated (model parameters, free initial values and ' ...
+        'error-model parameters). AICc needs at least %d informative data points: ' ...
+        'increase the length of the calibration period or fix more parameters.'], ...
+        nEffWindow, nEffInfo.nObs, nEffInfo.pinnedPoints, numparams, numparams+2)
 
 end
 
@@ -224,11 +240,34 @@ if tend1<tstart1
 
 end
 
+% Clip tend1 to the last window that fits in the data (plus the held-out
+% forecast targets when performance is evaluated). Must run BEFORE the
+% rolling-window arrays below are allocated with length(tstart1:1:tend1) rows.
+rowsNeededAfterStart = windowsize1 - 1 + forecastingperiod*(getperformance>0);
+if (tend1 + rowsNeededAfterStart) > length(data(:,1))
+    tend1_new = length(data(:,1)) - rowsNeededAfterStart;
+    if tend1_new < tstart1
+        error(['No rolling window fits: tstart1 = %d, windowsize1 = %d, forecastingperiod = %d ' ...
+               'need rows through %d but the data has %d rows.'], ...
+               tstart1, windowsize1, forecastingperiod, tstart1+rowsNeededAfterStart, length(data(:,1)));
+    end
+    warning('Run_Forecasting_ODEModel2:tend1', ...
+        'tend1 = %d exceeds the data (%d rows); using tend1 = %d.', ...
+        tend1, length(data(:,1)), tend1_new);
+    tend1 = tend1_new;
+end
+
 % <==================================================================================>
 % ============================ Rolling window analysis=====================================>
 % <==================================================================================>
 
-param_estims=zeros(params.num+length(vars.fit_index)+2,3,length(tstart1:1:tend1)); % median, 95% CI: LB, UB
+% Count likelihoods (method1 = 1, 3, 4, 5) cannot fit negative observations: stop
+% now, before any fitting, and list the offending rows of every calibration
+% window (rows tstart1 .. tend1+windowsize1-1). Rows used only to evaluate
+% forecasts are not checked.
+quantdiffCheckNegativeData(method1, data, tstart1:(tend1+windowsize1-1), mfilename);
+
+param_estims=zeros(params.num+length(vars.fit_index)+2,3,length(tstart1:1:tend1)); % point estimate (best fit to the data), 95% CI: LB, UB
 
 if method1==3 | method1==4
     MCEs=zeros(length(tstart1:1:tend1),params.num+length(vars.fit_index)+1); % if method1==3 | method1==4
@@ -244,10 +283,26 @@ else
 
 end
 
-% PII_box = log10(UB/LB) of the optimizer box for each parameter (max attainable PII);
-% PII_ratio = SCI./PII_box (~1 => the bootstrap CI is the box, PII censored; NaN => pinned).
+% Identifiability measures of each window (all computed by quantdiffPII):
+%   SCI           PII = log10(UB/LB) of the bootstrap 95% interval; NaN when the lower
+%                 quantile is <= 0 (never Inf or complex)
+%   PII_rangeFrac interval width as a fraction of the optimizer range, in [0,1];
+%                 defined for every estimated parameter, also at zero
+%   PII_scale     headline measure: 1 = SCI (lower bound > 0), 0 = PII_rangeFrac
+%                 (lower bound <= 0); params.PIIscale overrides it per parameter
+%   PII_box       log10(UB/LB) of the optimizer box (max attainable PII); NaN when LB <= 0
+%   PII_ratio     ~1 => the interval is the box (censored): SCI./PII_box on the log
+%                 scale, PII_rangeFrac otherwise; NaN => pinned
+SCI=nan(size(SCI));
 PII_box  =nan(size(SCI));
 PII_ratio=nan(size(SCI));
+PII_rangeFrac=nan(size(SCI));
+PII_scale=nan(size(SCI));
+piiScaleUser=nan(1,size(SCI,2));           % optional params.PIIscale: 1 log, 0 range fraction, NaN automatic
+if isfield(params,'PIIscale') && ~isempty(params.PIIscale)
+    nPIIuser=min(numel(params.PIIscale),size(SCI,2));
+    piiScaleUser(1:nPIIuser)=params.PIIscale(1:nPIIuser);
+end
 
 % Bound-hitting fractions (bound-censoring diagnostic complementing PII_ratio):
 % share of bootstrap draws within boundHitTol (relative, 0.1%) of LB and of UB,
@@ -256,6 +311,17 @@ PII_ratio=nan(size(SCI));
 boundHitTol = 1e-3;
 fracLB = nan(size(SCI));
 fracUB = nan(size(SCI));
+
+% Monte Carlo standard errors of what is REPORTED: the 2.5% / 97.5% bootstrap
+% quantiles (CI endpoints) and the PII = log10(UB/LB) built from them, obtained by
+% resampling the M bootstrap estimates B2 times (no refits; see quantileMCSE).
+% MCEs (std/sqrt(M), the SE of the bootstrap MEAN) is kept for reference only.
+% Saved per replicate so summarizeIdentifiability can report the PII together
+% with its Monte Carlo noise.
+B2 = 500;                                                                                        % MCSE
+MCSE_LB  = nan(size(SCI));                                                                       % MCSE
+MCSE_UB  = nan(size(SCI));                                                                       % MCSE
+MCSE_PII = nan(size(SCI));                                                                       % MCSE
 
 RMSECSS=[];
 MSECSS=[];
@@ -274,13 +340,6 @@ WISFSS=[];
 quantilescs=[];
 quantilesfs=[];
 
-if (tend1+windowsize1-1) > length(data(:,1))
-
-    tend1= length(data(:,1))-windowsize1+1;
-    'adjusting tend1'
-
-end
-
 % Numerical-policy provenance; retained for every rolling window and draw.
 numericalAudit = struct('profile',[], 'originalFits',{{}}, 'bootstrapFits',{{}});
 AICcs=[];
@@ -292,7 +351,22 @@ performanceF_all = [];
 
 cc1=1;
 
+% dist1 (the error structure requested by the options file) is never changed
+% inside the loop: it is part of every output file name, which the plotting and
+% ensemble functions rebuild from the options file. The noise model actually
+% used by the bootstrap of each window is dist1_boot (it differs from dist1 only
+% when a window falls back to Poisson noise) and is recorded in noiseLog:
+% one row per window, [tstart dist1 dist1_boot factor1 d rawEstimate negativeShare].
+% negativeShare is the expected share of bootstrap draws below zero for normal
+% and Laplace noise (NaN for the other noise models); a warning is issued when
+% it exceeds negNoiseTol (see quantdiffNegativeNoiseShare).
+noiseLog=[];
+negNoiseTol=0.05;
+
 for i=tstart1:1:tend1  %rolling window analysis
+
+    dist1_boot=[];        % set below; [] = same as dist1
+    noiseRaw=NaN;         % dispersion / scale estimate before any fallback
 
     t_window=i:1:i+windowsize1-1;
 
@@ -339,9 +413,20 @@ for i=tstart1:1:tend1  %rolling window analysis
     % Optimizer box used for the point fit on the real data (same box the bootstrap refits use,
     % except the data-dependent X0 upper bound). Pinned entries (LB==UB) give PII_box=0 -> ratio NaN.
     LBbox = fitDiagnostics_model1d.LB;  UBbox = fitDiagnostics_model1d.UB;
-    PII_box(cc1,:) = log10(UBbox(1:size(SCI,2))) - log10(LBbox(1:size(SCI,2)));
+    % PII_box of this window is set by quantdiffPII below (NaN when a lower bound is <= 0).
 
-    [AICc,part1,part2,numparams]=getAICc(method1,dist1,sum(params.fixed==0),length(vars.fit_index).*(params.fixI0==0),fval,length(ydata))
+    % Sample size for AICc and the residual variance: the fixed first point of
+    % each series (params.fixI0 = 1) is not counted (quantdiffEffectiveN).
+    nEff=quantdiffEffectiveN(length(ydata),length(vars.fit_index),params.fixI0);
+
+    % Count likelihoods: complete the objective to a full log-likelihood of the
+    % informative observations (adds sum(log(y!)), removes the fixed first points),
+    % so AICc is on the same footing as for least squares and SAD. Zero for
+    % methods 0 and 6; fval itself is not changed (quantdiffAICcCountAdjustment).
+    fvalAdjustAICc=quantdiffAICcCountAdjustment(method1,ydata,length(vars.fit_index),params.fixI0, ...
+        P_model1d(params.num+length(vars.fit_index)+1),P_model1d(params.num+length(vars.fit_index)+2));
+
+    [AICc,part1,part2,numparams]=getAICc(method1,dist1,sum(params.fixed==0),length(vars.fit_index).*(params.fixI0==0),fval,nEff,fvalAdjustAICc)
 
     AICcs=[AICcs;[i AICc part1 part2 numparams]];
 
@@ -349,33 +434,44 @@ for i=tstart1:1:tend1  %rolling window analysis
 
         factor1=1;
 
-    elseif (method1==0 & dist1==2)  % estimate <factor1> which is the variance to mean ratio to scale the NB error structure
+    elseif (method1==0 & dist1==2)  % NB bootstrap noise with VAR = factor1*mean
 
-        binsize1=7;
+        % Pearson dispersion of the data around the FITTED curve (quasi-Poisson
+        % estimator), so the epidemic trend is not counted as noise. Replaces the
+        % var/mean ratio of bins of the raw data, which was inflated by the trend.
+        % The divisor is n minus the estimated quantities of the CURVE: numparams
+        % also counts the Gaussian variance of the least-squares fit, hence the -1.
+        [factor1, dispInfo] = estimatePearsonDispersion(ydata, fitcurve_model1d, numparams-1, ...
+            length(vars.fit_index), params.fixI0);
+        noiseRaw=factor1;
 
-        if length(ydata)<binsize1*3
-            binsize1=round(binsize1/2);
-
+        if ~isfinite(factor1)
+            warning('QuantDiffForecast:dispersion', ...
+                ['Window %d: the dispersion cannot be estimated: %d usable points for %d curve parameters ' ...
+                 '(%d points excluded because the fitted mean is below %g, %d fixed first points). ' ...
+                 'If the data are rates or proportions rather than counts, the VAR = factor*mean noise ' ...
+                 'model (dist1 = 2) does not apply. Using Poisson bootstrap noise for this window.'], ...
+                i, dispInfo.nUsed, numparams-1, dispInfo.excludedSmallMean, dispInfo.minMean, dispInfo.excludedFixed);
         end
 
-        [ratios,~]=getMeanVarianceRatio(ydata,binsize1,1);
-
-        index1=find(ratios(:,1)>0);
-
-        factor1=mean(ratios(index1,1));
-
-        if factor1<1
-            dist1=1;
+        % VAR = factor1*mean needs factor1 > 1 (factor1 = 1 gives an NB with
+        % infinite size). Not over-dispersed -> Poisson noise for THIS window's
+        % bootstrap only (dist1_boot); dist1 and the output file names are unchanged.
+        if ~isfinite(factor1) || factor1 <= 1
+            dist1_boot=1;
             factor1=1;
         end
-
 
     elseif method1==0 & dist1==0 % normal distribution of the error structure
 
         size(fitcurve_model1d)
         size(ydata)
 
-        var1=sum((fitcurve_model1d-ydata).^2)./(length(fitcurve_model1d)-numparams); % last revised: 01 June 2022
+        % Residual variance: SSE over the informative points minus the estimated
+        % quantities of the CURVE. nEff leaves out the fixed first points; numparams
+        % also counts the Gaussian variance itself, hence the -1. (For one fitted
+        % series with fixI0 = 1 this equals the former SSE/(n - numparams).)
+        var1=sum((fitcurve_model1d-ydata).^2)./(nEff-(numparams-1));
         factor1=sqrt(var1);
 
     elseif method1==1
@@ -403,14 +499,54 @@ for i=tstart1:1:tend1  %rolling window analysis
 
         factor1=alpha;
 
-    elseif method1==6 % normal distribution of the error structure
+    elseif method1==6 % Laplace error structure (SAD fit)
 
         dist1=6;
 
-        var1=sum((fitcurve_model1d-ydata).^2)./(length(fitcurve_model1d)-numparams); % last revised: 01 June 2022
-        factor1=sqrt(var1)/sqrt(2);
+        % Laplace scale from the mean absolute residual: the maximum-likelihood value
+        % SAD/n (as in getAICc and the profile likelihood) with the small-sample
+        % correction SAD/(n - p/2). numparams counts the Laplace scale itself, so the
+        % curve has numparams-1 estimated quantities. Robust to outliers (the former
+        % SD/sqrt(2) squared the residuals).
+        [factor1, laplaceInfo] = estimateLaplaceScale(ydata, fitcurve_model1d, numparams-1, ...
+            length(vars.fit_index), params.fixI0);
+        noiseRaw=factor1;
+
+        if ~isfinite(factor1)
+            % Too few free points for the corrected estimate: use the plain
+            % maximum-likelihood scale over all points instead of stopping the run.
+            factor1=sum(abs(fitcurve_model1d(:)-ydata(:)))/numel(ydata);
+            warning('QuantDiffForecast:laplaceScale', ...
+                'Window %d: only %d usable points for %d curve parameters; using the uncorrected Laplace scale SAD/n = %g.', ...
+                i, laplaceInfo.nUsed, numparams-1, factor1);
+        end
+        if ~(factor1 > 0)
+            error('QuantDiffForecast:laplaceScale', ...
+                'Window %d: the Laplace scale is %g (an exact fit); the Laplace bootstrap needs a positive scale.', i, factor1);
+        end
 
     end
+
+    if isempty(dist1_boot)
+        dist1_boot=dist1;
+    end
+
+    % Normal and Laplace bootstrap noise use one scale for the whole series, so
+    % where the fitted counts are small a large part of the draws is negative.
+    % The draws are not truncated (that would bias the refits); warn instead.
+    [negShare, negInfo]=quantdiffNegativeNoiseShare(fitcurve_model1d,factor1,dist1_boot,length(vars.fit_index));
+    if negShare>negNoiseTol
+        if dist1_boot==0, noiseName='normal'; scaleName='SD'; else, noiseName='Laplace'; scaleName='scale'; end
+        warning('QuantDiffForecast:negativeNoise', ...
+            ['Window %d: about %.0f%% of the %s bootstrap draws will be negative (noise %s %.3g; ' ...
+             'fitted values as low as %.3g; up to %.0f%% at the lowest point). A constant-scale noise ' ...
+             'model fits these data poorly at low counts, so the bootstrap intervals may be unreliable ' ...
+             'there. For counts consider dist1 = 2 with method1 = 0 (negative binomial noise scaled by ' ...
+             'the mean) or a count likelihood (method1 = 1, 3, 4 or 5). The draws are not truncated.'], ...
+            i, 100*negShare, noiseName, scaleName, factor1, negInfo.minMean, 100*negInfo.worstPoint);
+    end
+
+    noiseLog=[noiseLog;[i dist1 dist1_boot factor1 d noiseRaw negShare]];
 
 
     % <===========================================================================================>
@@ -436,7 +572,7 @@ for i=tstart1:1:tend1  %rolling window analysis
 
     for j=1:M
 
-        f_model1_sim=AddErrorStructure(cumsum(fitcurve_model1d),1,dist1,factor1,d);
+        f_model1_sim=AddErrorStructure(cumsum(fitcurve_model1d),1,dist1_boot,factor1,d);
 
         f_model1_sims=[f_model1_sims f_model1_sim];
 
@@ -444,15 +580,19 @@ for i=tstart1:1:tend1  %rolling window analysis
         % Fit model1 to bootstrap data
         %data1=[timevect1 f_model1_sim];
 
-        data1=[timevect1 reshape(f_model1_sim,length(t_window),length(vars.fit_index))];
+        % The replicate has its own variable: data1 keeps the OBSERVED calibration
+        % data (it is returned by this function and saved with the results). The
+        % time column is the raw index, as in the fit to the observed data
+        % (fit_model applies DT itself).
+        data1_boot=[data(t_window,1) reshape(f_model1_sim,length(t_window),length(vars.fit_index))];
 
-        data1(1,2:1+length(vars.fit_index))=I0;
+        data1_boot(1,2:1+length(vars.fit_index))=I0;
 
 
         %params0=initialParams(data1(:,2),flag1);
         params0=P_model1d;
 
-        [P_model1,residual_model1, fitcurve_model1, forecastcurve_model1, timevect2,initialguess,fval, F1,F2,fitDiagnostics_model1]=fit_model(data1,params0,1,DT,model,params,vars,forecastingperiod);
+        [P_model1,residual_model1, fitcurve_model1, forecastcurve_model1, timevect2,initialguess,fval, F1,F2,fitDiagnostics_model1]=fit_model(data1_boot,params0,1,DT,model,params,vars,forecastingperiod);
         numericalAudit.bootstrapFits{cc1,j} = fitDiagnostics_model1;
 
         fit_model1=[fit_model1 fitcurve_model1];
@@ -463,13 +603,13 @@ for i=tstart1:1:tend1  %rolling window analysis
             Ys(i2,j)={F2(:,i2)};
         end
 
-        if (method1==0 & (dist1==0 | dist1==2)) | (method1==6 & dist1==6)
+        if (method1==0 & (dist1_boot==0 | dist1_boot==2)) | (method1==6 & dist1_boot==6)
 
-            forecast_model12=[forecast_model12 AddErrorStructure(cumsum(forecastcurve_model1),20,dist1,factor1,0)];
+            forecast_model12=[forecast_model12 AddErrorStructure(cumsum(forecastcurve_model1),20,dist1_boot,factor1,0)];
 
         else
 
-            forecast_model12=[forecast_model12 AddErrorStructure(cumsum(forecastcurve_model1),20,dist1,P_model1(end-1),P_model1(end))];
+            forecast_model12=[forecast_model12 AddErrorStructure(cumsum(forecastcurve_model1),20,dist1_boot,P_model1(end-1),P_model1(end))];
 
         end
 
@@ -482,7 +622,9 @@ for i=tstart1:1:tend1  %rolling window analysis
 
     end %end bootstrapping loop
 
-    data1=[timevect1 data1(:,2:end)];
+    % Observed calibration data with the time column scaled by DT (as before);
+    % formerly the data columns held the last bootstrap replicate.
+    data1=[timevect1 datac];
 
     datalatest=data(i:end,1:end);
 
@@ -608,9 +750,12 @@ for i=tstart1:1:tend1  %rolling window analysis
 
         median1=median(forecast2,2);
 
-        figure(100+i*20+j)
-
         if printscreen1
+
+            % figure() created only when plotting is requested: this runner is called
+            % once per replicate (often inside parfor with printscreen1 = 0), and an
+            % unconditional figure was built on every call.
+            figure(100+i*20+j)
 
             tiledlayout(1,1,'Padding', 'compact', 'TileSpacing', 'compact')
             nexttile(1)
@@ -675,7 +820,7 @@ for i=tstart1:1:tend1  %rolling window analysis
         % <========================================================================================>
         % <========================================================================================>
 
-        if getperformance
+        if getperformance && printscreen1    % printscreen1 governs every figure, including this one
 
             if forecastingperiod>0
                 figure(200+i*20+j)
@@ -813,58 +958,74 @@ for i=tstart1:1:tend1  %rolling window analysis
     % <================================ Parameter estimates =========================================>
     % <========================================================================================>
 
-    % estimate median and 95% CI from distribution of parameter estimates
+    % point estimate = best fit to the observed data (P_model1d); 95% CI from the bootstrap distribution
 
 
     for j=1:params.num
 
-        param_estims(j,1:3,cc1) = [median(Phatss_model1(:,j)) quantile(Phatss_model1(:,j),0.025) quantile(Phatss_model1(:,j),0.975)];
+        param_estims(j,1:3,cc1) = [P_model1d(j) quantile(Phatss_model1(:,j),0.025) quantile(Phatss_model1(:,j),0.975)];
 
         MCEs(cc1,j)=std(Phatss_model1(:,j))/sqrt(M);
                 
-        SCI(cc1,j)=log10(param_estims(j,3,cc1))-log10((param_estims(j,2,cc1)));
 
     end
 
     for j=1:length(vars.fit_index)
 
-        param_estims(params.num+j,1:3,cc1) = [median(Phatss_model1(:,params.num+j)) quantile(Phatss_model1(:,params.num+j),0.025) quantile(Phatss_model1(:,params.num+j),0.975)];
+        param_estims(params.num+j,1:3,cc1) = [P_model1d(params.num+j) quantile(Phatss_model1(:,params.num+j),0.025) quantile(Phatss_model1(:,params.num+j),0.975)];
 
         MCEs(cc1,params.num+j)=std(Phatss_model1(:,params.num+j))/sqrt(M); %X0
 
-        SCI(cc1,params.num+j)=log10(param_estims(params.num+j,3,cc1))-log10((param_estims(params.num+j,2,cc1)));
 
     end
 
 
-    param_estims(params.num+j+1,1:3,cc1) = [median(Phatss_model1(:,params.num+j+1)) quantile(Phatss_model1(:,params.num+j+1),0.025) quantile(Phatss_model1(:,params.num+j+1),0.975)];
-    param_estims(params.num+j+2,1:3,cc1) = [median(Phatss_model1(:,params.num+j+2)) quantile(Phatss_model1(:,params.num+j+2),0.025) quantile(Phatss_model1(:,params.num+j+2),0.975)];
+    param_estims(params.num+j+1,1:3,cc1) = [P_model1d(params.num+j+1) quantile(Phatss_model1(:,params.num+j+1),0.025) quantile(Phatss_model1(:,params.num+j+1),0.975)];
+    param_estims(params.num+j+2,1:3,cc1) = [P_model1d(params.num+j+2) quantile(Phatss_model1(:,params.num+j+2),0.025) quantile(Phatss_model1(:,params.num+j+2),0.975)];
+    % Point estimate = fit to the observed data (P_model1d); the 95% interval is the
+    % 2.5-97.5% percentile range of the bootstrap refits. The bootstrap medians are kept
+    % for reference, and an estimate outside its own interval is flagged: it signals
+    % bootstrap bias (e.g. an estimate on a bound or along a ridge), not a coding error.
+    param_bootmedian(:,cc1) = median(Phatss_model1,1)';
+    outsideCI = (P_model1d(:)' < quantile(Phatss_model1,0.025,1)) | (P_model1d(:)' > quantile(Phatss_model1,0.975,1));
+    estimOutsideCI(cc1,1:numel(outsideCI)) = outsideCI;
+    if any(outsideCI)
+        zlab = [params.label(:)', arrayfun(@(k) sprintf('X0(%d)',k), vars.fit_index, 'UniformOutput', false), {'alpha','d'}];
+        warning('QuantDiffForecast:estimateOutsideCI', ...
+            ['Window %d: the fitted value of %s lies outside its bootstrap 95%% interval. ' ...
+            'This indicates bootstrap bias (often an estimate on a bound or along a ridge); inspect the fit before reporting.'], ...
+            i, strjoin(zlab(outsideCI), ', '));
+    end
 
     if method1==3 | method1==4
         MCEs(cc1,params.num+j+1)=std(Phatss_model1(:,params.num+j+1))/sqrt(M); %alpha
 
-        SCI(cc1,params.num+j+1)=log10(param_estims(params.num+j+1,3,cc1))-log10((param_estims(params.num+j+1,2,cc1)));
 
     elseif method1==5
         MCEs(cc1,params.num+j+1)=std(Phatss_model1(:,params.num+j+1))/sqrt(M); %alpha
         MCEs(cc1,params.num+j+2)=std(Phatss_model1(:,params.num+j+2))/sqrt(M); %d
 
-        SCI(cc1,params.num+j+1)=log10(param_estims(params.num+j+1,3,cc1))-log10((param_estims(params.num+j+1,2,cc1)));
 
-        SCI(cc1,params.num+j+2)=log10(param_estims(params.num+j+2,3,cc1))-log10((param_estims(params.num+j+2,2,cc1)));
     end
 
     % fraction of the box width (log10 scale) still occupied by the bootstrap 95% CI
-    PII_ratio(cc1,:) = SCI(cc1,:) ./ PII_box(cc1,:);
+    nPII=size(SCI,2);
+    [SCI(cc1,:), PII_rangeFrac(cc1,:), PII_scale(cc1,:), PII_box(cc1,:), PII_ratio(cc1,:)] = quantdiffPII( ...
+        reshape(param_estims(1:nPII,2,cc1),1,[]), reshape(param_estims(1:nPII,3,cc1),1,[]), ...
+        LBbox(1:nPII), UBbox(1:nPII), piiScaleUser);
 
     % fraction of bootstrap draws within boundHitTol (relative) of LB / UB of their own box
     [fracLB(cc1,:), fracUB(cc1,:)] = boundHitFractions(Phatss_model1(:,1:size(SCI,2)), ...
         LBboot(:,1:size(SCI,2)), UBboot(:,1:size(SCI,2)), boundHitTol);
 
+    % Monte Carlo SE of the CI endpoints and of the PII (bootstrap-the-bootstrap).
+    [MCSE_LB(cc1,:), MCSE_UB(cc1,:), MCSE_PII(cc1,:)] = ...                                         % MCSE
+        quantileMCSE(Phatss_model1(:,1:size(SCI,2)), B2);                                          % MCSE
+
 
     if isempty(params.composite)==0
         compositetemp=params.composite(Phatss_model1);
-        composite12=[composite12;[median(compositetemp) quantile(compositetemp,0.025) quantile(compositetemp,0.975)]]
+        composite12=[composite12;[params.composite(P_model1d(:)') quantile(compositetemp,0.025) quantile(compositetemp,0.975)]]
     else
         composite12=[composite12;[NaN NaN NaN]]
     end
@@ -874,9 +1035,14 @@ for i=tstart1:1:tend1  %rolling window analysis
     % <========================================================================================>
 
 
-    if printscreen1
+    % Fixed parameters have no bootstrap spread: they get no panel (and no
+    % histogram CSV). Panels are laid out up to four per row so titles do not collide.
+    freeIdx = find(params.fixed==0);
+    nCols = max(1, min(4, numel(freeIdx))); nRows = max(1, ceil(numel(freeIdx)/nCols));
+
+    if printscreen1 && ~isempty(freeIdx)
         figure(300+i*20+j)
-        tiledlayout(1,params.num,'Padding', 'compact', 'TileSpacing', 'compact')
+        tiledlayout(nRows, nCols, 'Padding', 'loose', 'TileSpacing', 'compact')   % loose padding leaves room for the axis labels
 
     end
 
@@ -885,10 +1051,19 @@ for i=tstart1:1:tend1  %rolling window analysis
 
     for j=1:params.num
 
-        if printscreen1
-            nexttile(j)
+        if printscreen1 && params.fixed(j)==0
+            nexttile(find(freeIdx==j))
             hist(Phatss_model1(:,j))
             hold on
+            % Best fit to the observed data (P_model1d) as a dashed red line
+            % (x-limits padded so the line stays visible when the estimate sits on
+            % the edge of the histogram, e.g. on a parameter bound)
+            ylimHist = ylim;
+            plot([P_model1d(j) P_model1d(j)], ylimHist, 'r--', 'LineWidth', 2);
+            ylim(ylimHist);
+            xlimHist = xlim;
+            padHist = 0.03*diff(xlimHist);
+            xlim([min(xlimHist(1), P_model1d(j)-padHist) max(xlimHist(2), P_model1d(j)+padHist)]);
 
             %save parameter histogram
            [counts, edges]=hist(Phatss_model1(:,j));
@@ -906,21 +1081,21 @@ for i=tstart1:1:tend1  %rolling window analysis
         params1=[params1 param_estims(j,1,cc1)  param_estims(j,2,cc1) param_estims(j,3,cc1) ];
 
         if isempty(params.label)
-            xlabel(strcat('param(',num2str(j),')'))
+            if printscreen1 && params.fixed(j)==0, xlabel(strcat('param(',num2str(j),')')), end
             cad1=strcat('param(',num2str(j),')=',num2str(param_estims(j,1,cc1),2),' (95% CI:',num2str(param_estims(j,2,cc1) ,2),',',num2str(param_estims(j,3,cc1) ,2),')');
 
             paramslabels1(1+(j-1)*3:j*3)={strcat('param(',num2str(j),')'), strcat('param(',num2str(j),')_95%CI LB'), strcat('param(',num2str(j),')_95%CI UB')};
         else
-            xlabel(params.label(j))
+            if printscreen1 && params.fixed(j)==0, xlabel(params.label(j)), end
             cad1=strcat(cell2mat(params.label(j)),'=',num2str(param_estims(j,1,cc1),2),' (95% CI:',num2str(param_estims(j,2,cc1) ,2),',',num2str(param_estims(j,3,cc1) ,2),')');
 
             paramslabels1(1+(j-1)*3:j*3)={cell2mat(params.label(j)), strcat(cell2mat(params.label(j)),'_95%CI LB'), strcat(cell2mat(params.label(j)),'_95%CI UB')};
         end
 
-        if printscreen1
+        if printscreen1 && params.fixed(j)==0
             ylabel('Frequency')
 
-            title(cad1)
+            k1 = strfind(cad1, ' (95% CI:'); if ~isempty(k1) && cad1(end) == ')', title({cad1(1:k1(1)-1), ['95% CI: ' strrep(cad1(k1(1)+9:end-1), ',', ', ')]}), else, title(cad1), end   % two-line title: estimate over its interval, so adjacent panels do not overlap
 
             set(gca,'FontSize',GetAdjustedFontSize);
             set(gcf,'color','white')
@@ -950,61 +1125,12 @@ for i=tstart1:1:tend1  %rolling window analysis
 
     paramss=[paramss;params1];
 
-    % <=======================================================================================>
-    % <======================= Plot neg. loglikelihood profiles of the parameters =============>
-    % <========================================================================================>
-
-    if printscreen1
-        figure(400+i*20+j)
-        tiledlayout(1,params.num,'Padding', 'compact', 'TileSpacing', 'compact')
-
-    end
-
-    for j=1:params.num
-
-        if printscreen1
-
-            nexttile(j)
-
-            profile1=sortrows([Phatss_model1(:,j) fvals_model1],1);
-
-            plot(profile1(:,1),profile1(:,2),'bo')
-            hold on
-
-            % Apply interpolation
-            if params.fixed(j)==0
-
-                 span = 0.15; % or adjust as needed
-                 y_smooth = smoothdata(profile1(:,2), 'loess', span);
-
-
-                %x_interp=linspace(profile1(1,1),profile1(end,1),100);
-                %y_interp1 = interp1(profile1(:,1),profile1(:,2),x_interp);
-
-                plot(profile1(:,1),y_smooth, '-r', 'LineWidth', 2); % Smoothed curve
-            end
-
-        end
-
-
-        if isempty(params.label)
-            xlabel(strcat('param(',num2str(j),')'))
-            cad1=strcat('param(',num2str(j),')=',num2str(param_estims(j,1,cc1),2),' (95% CI:',num2str(param_estims(j,2,cc1) ,2),',',num2str(param_estims(j,3,cc1) ,2),')');
-        else
-            xlabel(params.label(j))
-            cad1=strcat(cell2mat(params.label(j)),'=',num2str(param_estims(j,1,cc1),2),' (95% CI:',num2str(param_estims(j,2,cc1) ,2),',',num2str(param_estims(j,3,cc1) ,2),')');
-        end
-
-        if printscreen1
-            ylabel('Objective function')
-
-            title(cad1)
-
-            set(gca,'FontSize', GetAdjustedFontSize);
-            set(gcf,'color','white')
-        end
-
-    end
+    % (Removed: the 'bootstrap objective vs parameter' figure. Each point was the
+    %  objective of a DIFFERENT bootstrap dataset, so its spread reflected how many
+    %  cases each replicate contained, not the shape of the likelihood, and the
+    %  figure read like a profile it was not. For the curvature of the likelihood in
+    %  one parameter use Run_ProfileLikelihood_ODEModel. (This runner does not
+    %  save the bootstrap objective values; Run_Forecasting_ODEModel does.)
 
     cc1=cc1+1;
 
@@ -1013,7 +1139,7 @@ end % rolling window analysis
 
 %% plot all state variables in a figure
 
-if vars.num>1
+if vars.num>1 && printscreen1          % plot-only block (its CSV write is disabled in this runner)
 
     figure(400)
 
@@ -1053,7 +1179,7 @@ if vars.num>1
         plot(quantile(cell2mat(Ys(i2,:,:))',0.975),'k--')
         %end
 
-        dataTable=[dataTable [quantile(cell2mat(Ys(i2,:,:))',0.5)' quantile(cell2mat(Ys(i2,:,:))',0.025)' quantile(cell2mat(Ys(i2,:,:))',0.975)']]
+        dataTable=[dataTable [quantile(cell2mat(Ys(i2,:,:))',0.5)' quantile(cell2mat(Ys(i2,:,:))',0.025)' quantile(cell2mat(Ys(i2,:,:))',0.975)']];
 
         varslabels1((i2-1)*3+2)=append({'median '},vars.label(i2));
         varslabels1((i2-1)*3+3)=append({'95% LB '},vars.label(i2));
@@ -1089,7 +1215,7 @@ end
 fileName = sprintf('results_%s%s.mat', window_file_token, replicate_file_token);
 fullFilePath = fullfile(outputDir, fileName);
 
-save(fullFilePath, 'paramss', 'performanceC', 'SCI', 'PII_box', 'PII_ratio', 'fracLB', 'fracUB', 'boundHitTol', 'LBbox', 'UBbox', 'forecast_outputs', 'performanceC_all', 'performanceF_all', 'numericalAudit', '-mat');
+save(fullFilePath, 'paramss', 'param_bootmedian', 'estimOutsideCI', 'performanceC', 'SCI', 'PII_box', 'PII_ratio', 'PII_rangeFrac', 'PII_scale', 'fracLB', 'fracUB', 'boundHitTol', 'LBbox', 'UBbox', 'forecast_outputs', 'performanceC_all', 'performanceF_all', 'numericalAudit', 'MCSE_LB', 'MCSE_UB', 'MCSE_PII', 'B2', '-mat');
 
 % Print bootstrap counts only; do not change fitting or retained results.
 requestedBootstrap = M * numel(numericalAudit.originalFits);
@@ -1098,3 +1224,36 @@ acceptedBootstrap = sum(cellfun(@(d) d.optimizerExitflag > 0 && ...
 fprintf('\nRequested bootstrap datasets: %d\n', requestedBootstrap);
 fprintf('Accepted bootstrap datasets: %d\n', acceptedBootstrap);
 fprintf('Unresolved bootstrap datasets: %d\n\n', requestedBootstrap - acceptedBootstrap);
+
+end % main function (explicit end required because a local function follows)
+
+
+% <============================================================================>
+% < Monte Carlo SE of bootstrap quantiles (bootstrap-the-bootstrap)           ==>
+% <============================================================================>
+function [mcseLB, mcseUB, mcsePII] = quantileMCSE(Phatss, B2)
+% QUANTILEMCSE  Monte Carlo standard error of the reported bootstrap interval.
+%   Resamples the rows of Phatss (M-by-d bootstrap estimates) with replacement
+%   B2 times, recomputes the 2.5% and 97.5% quantiles and PII = log10(q97.5/q2.5)
+%   of every column, and returns the SD across resamples: the seed-to-seed
+%   noise of the CI endpoints and of the PII. No refits are performed.
+%   Columns with zero spread (pinned parameters) and all-NaN columns give NaN.
+%   PII is NaN where a quantile is nonpositive (log10 undefined), as in SCI.
+[M, d] = size(Phatss);
+mcseLB = nan(1, d); mcseUB = nan(1, d); mcsePII = nan(1, d);
+if M < 2 || B2 < 2, return, end
+rs  = RandStream('mt19937ar', 'Seed', 20261030);           % local stream: the global RNG (and later windows' bootstrap draws) are untouched
+idx = randi(rs, M, M, B2);                                 % one resample per column
+for k = 1:d
+    x = Phatss(:, k);
+    if all(isnan(x)) || max(x) - min(x) == 0, continue, end   % pinned / degenerate
+    xr  = reshape(x(idx), M, B2);                          % M-by-B2 resampled estimates
+    q   = quantile(xr, [0.025 0.975], 1);                  % 2-by-B2
+    mcseLB(k) = std(q(1, :), 0, 2);
+    mcseUB(k) = std(q(2, :), 0, 2);
+    ok = q(1, :) > 0 & q(2, :) > 0;
+    if nnz(ok) >= 2
+        mcsePII(k) = std(log10(q(2, ok)) - log10(q(1, ok)), 0, 2);
+    end
+end
+end
